@@ -4,9 +4,11 @@
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 import torch
+from huggingface_hub import HfApi
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
@@ -42,6 +44,49 @@ def get_model_class(
         return AutoModelForImageTextToText
     else:
         return AutoModelForCausalLM
+
+
+def _raise_if_gguf_model(model: str) -> None:
+    """
+    Raises a clear error if the model is in GGUF format, which Heretic does
+    not support.
+
+    Without this check, passing a GGUF model only fails later with a
+    confusing tokenizer initialization error, sending users down the wrong
+    path (see https://github.com/p-e-w/heretic/issues/533).
+    """
+
+    def is_gguf_only(filenames: list[str]) -> bool:
+        # Repositories that ship both formats can be used through their
+        # Safetensors weights, so only pure-GGUF models are rejected.
+        return any(name.lower().endswith(".gguf") for name in filenames) and not any(
+            name.lower().endswith(".safetensors") for name in filenames
+        )
+
+    path = Path(model)
+
+    if path.is_file():
+        is_gguf = path.suffix.lower() == ".gguf"
+    elif path.is_dir():
+        is_gguf = is_gguf_only([p.name for p in path.rglob("*") if p.is_file()])
+    else:
+        # Hugging Face repository ID. Failure to reach the Hub must not
+        # prevent loading (e.g. cached models in offline environments),
+        # so fall through silently and let the regular loading path
+        # report its usual errors.
+        try:
+            info = HfApi().model_info(model)
+        except Exception:
+            return
+        is_gguf = is_gguf_only(
+            [sibling.rfilename for sibling in info.siblings or []]
+        )
+
+    if is_gguf:
+        raise ValueError(
+            f"The model '{model}' is in GGUF format, which Heretic does not support. "
+            "Please use a model in Safetensors format instead."
+        )
 
 
 def check_model_resident(model: PreTrainedModel | PeftModel) -> None:
@@ -151,6 +196,8 @@ class Model:
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
+
+        _raise_if_gguf_model(settings.model)
 
         # PreTrainedTokenizerBase is the "base class for all tokenizer backends"
         # according to the documentation.
